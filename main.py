@@ -478,7 +478,12 @@ def stream_chat(resp, model: str, prompt_tokens: int, has_tools: bool = False):
     comp_tokens = token_count(clean_text or full_text, model)
 
     if tool_calls:
-        delta = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+        # Streaming tool_calls deltas must carry an "index" on each entry
+        # (unlike the non-streaming message.tool_calls shape) -- clients use
+        # it to merge argument fragments across chunks, and silently drop
+        # the whole delta if it's missing.
+        streamed_calls = [{**tc, "index": i} for i, tc in enumerate(tool_calls)]
+        delta = {"role": "assistant", "content": None, "tool_calls": streamed_calls}
         finish_reason = "tool_calls"
     else:
         delta = {"role": "assistant", "content": clean_text}
