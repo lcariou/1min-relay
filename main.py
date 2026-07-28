@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -183,6 +184,97 @@ def get_api_key():
     return h.split(" ", 1)[1].strip() or None
 
 
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def normalize_tools(data: dict):
+    """Accept both the current `tools`/`tool_choice` shape and the legacy
+    `functions`/`function_call` shape, and return them normalized as
+    (tools, tool_choice) using the current shape."""
+    tools = data.get("tools")
+    tool_choice = data.get("tool_choice")
+    if not tools and data.get("functions"):
+        tools = [{"type": "function", "function": f} for f in data["functions"]]
+        fc = data.get("function_call")
+        if isinstance(fc, dict) and fc.get("name"):
+            tool_choice = {"type": "function", "function": {"name": fc["name"]}}
+        elif fc in ("auto", "none"):
+            tool_choice = fc
+    return tools, tool_choice
+
+
+def build_tools_instructions(tools, tool_choice=None) -> str:
+    """Describe the requested tools to the model using an old-style,
+    prompt-based calling convention, since the upstream 1min.ai API has no
+    native tool-calling support."""
+    if not tools:
+        return ""
+
+    lines = [
+        "You have access to the following tools/functions. If, and only if, you need "
+        "to call one to fulfil the user's request, respond with nothing else but one "
+        "or more blocks in exactly this format:",
+        "<tool_call>",
+        '{"name": "<tool name>", "arguments": <a JSON object matching the tool parameters>}',
+        "</tool_call>",
+        "",
+        "You may emit several <tool_call> blocks if several tools are needed. Do not "
+        "add any commentary before, between, or after them when calling a tool. If no "
+        "tool call is required, answer normally in plain text without emitting any "
+        "<tool_call> block.",
+        "",
+        "Available tools:",
+    ]
+    for t in tools:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        name = fn.get("name", "unknown")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        lines.append(f"- {name}: {desc}")
+        lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
+
+    if isinstance(tool_choice, dict):
+        forced = tool_choice.get("function", {}).get("name")
+        if forced:
+            lines.append(f'\nYou MUST call the tool named "{forced}" now, using the format above.')
+    elif tool_choice == "required":
+        lines.append("\nYou MUST call one of the tools above now, using the format above.")
+    elif tool_choice == "none":
+        lines.append("\nDo not call any tool for this message; answer in plain text only.")
+
+    return "\n".join(lines)
+
+
+def extract_tool_calls(text: str):
+    """Parse the old-style <tool_call> blocks out of a model completion and
+    return (clean_text, tool_calls) in the OpenAI tool_calls shape."""
+    calls = []
+    for m in TOOL_CALL_RE.finditer(text or ""):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        name = obj.get("name")
+        if not name:
+            continue
+        args = obj.get("arguments", {})
+        args_str = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": args_str},
+            }
+        )
+    clean = TOOL_CALL_RE.sub("", text or "").strip()
+    return clean, (calls or None)
+
+
+def render_tool_call_block(tool_call: dict) -> str:
+    fn = tool_call.get("function", {})
+    return f'<tool_call>\n{{"name": "{fn.get("name", "")}", "arguments": {fn.get("arguments", "{}")}}}\n</tool_call>'
+
+
 def normalize_text(content):
     if isinstance(content, list):
         parts = []
@@ -195,12 +287,30 @@ def normalize_text(content):
     return str(content).strip() if content is not None else ""
 
 
-def build_prompt(messages, new_input=""):
-    lines = ["Conversation History:\n"]
+def build_prompt(messages, new_input="", tools=None, tool_choice=None):
+    lines = []
+    instructions = build_tools_instructions(tools, tool_choice)
+    if instructions:
+        lines.append(instructions)
+        lines.append("")
+
+    lines.append("Conversation History:\n")
     for msg in messages:
         role = str(msg.get("role", "")).capitalize()
+
+        if msg.get("role") == "tool":
+            content = normalize_text(msg.get("content", ""))
+            lines.append(f"Tool Result (call {msg.get('tool_call_id', '')}):\n{content}")
+            continue
+
         content = normalize_text(msg.get("content", ""))
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            blocks = "\n".join(render_tool_call_block(tc) for tc in tool_calls)
+            content = f"{content}\n{blocks}".strip() if content else blocks
+
         lines.append(f"{role}: {content}")
+
     if messages:
         lines.append("Respond like normal. Do not add role labels.")
         lines.append("User Message:\n")
@@ -247,9 +357,20 @@ def upload_image(url: str, headers: dict) -> str:
     return r.json()["fileContent"]["path"]
 
 
-def transform_chat(resp_json, model: str, prompt_tokens: int):
+def transform_chat(resp_json, model: str, prompt_tokens: int, has_tools: bool = False):
     text = resp_json["aiRecord"]["aiRecordDetail"]["resultObject"][0]
+
+    tool_calls = None
+    if has_tools:
+        text, tool_calls = extract_tool_calls(text)
+
     comp_tokens = token_count(text, model)
+    message = {"role": "assistant", "content": (text or None) if tool_calls else text}
+    finish_reason = "stop"
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        finish_reason = "tool_calls"
+
     return {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -258,8 +379,8 @@ def transform_chat(resp_json, model: str, prompt_tokens: int):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -270,10 +391,7 @@ def transform_chat(resp_json, model: str, prompt_tokens: int):
     }
 
 
-def stream_chat(resp, model: str, prompt_tokens: int):
-    stream_id = f"chatcmpl-{uuid.uuid4()}"
-    chunks = []
-
+def iter_upstream_content(resp):
     for raw in resp.iter_lines(decode_unicode=False):
         if raw == b"":
             continue
@@ -295,30 +413,82 @@ def stream_chat(resp, model: str, prompt_tokens: int):
         except Exception:
             content = data
 
-        if not content:
-            continue
+        if content:
+            yield content
 
-        chunks.append(content)
+
+def stream_chat(resp, model: str, prompt_tokens: int, has_tools: bool = False):
+    stream_id = f"chatcmpl-{uuid.uuid4()}"
+    chunks = []
+
+    if not has_tools:
+        for content in iter_upstream_content(resp):
+            chunks.append(content)
+            yield "data: " + json.dumps(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                },
+                ensure_ascii=False,
+            ) + "\n\n"
+
+        full_text = "".join(chunks)
+        comp_tokens = token_count(full_text, model)
         yield "data: " + json.dumps(
             {
                 "id": stream_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": comp_tokens,
+                    "total_tokens": prompt_tokens + comp_tokens,
+                },
             },
             ensure_ascii=False,
         ) + "\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # When tools are requested, the <tool_call> markers must be fully
+    # buffered before we can tell whether the completion is a tool call, so
+    # we cannot forward incremental deltas as they arrive from upstream.
+    for content in iter_upstream_content(resp):
+        chunks.append(content)
 
     full_text = "".join(chunks)
-    comp_tokens = token_count(full_text, model)
+    clean_text, tool_calls = extract_tool_calls(full_text)
+    comp_tokens = token_count(clean_text or full_text, model)
+
+    if tool_calls:
+        delta = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+        finish_reason = "tool_calls"
+    else:
+        delta = {"role": "assistant", "content": clean_text}
+        finish_reason = "stop"
+
     yield "data: " + json.dumps(
         {
             "id": stream_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        },
+        ensure_ascii=False,
+    ) + "\n\n"
+    yield "data: " + json.dumps(
+        {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": comp_tokens,
@@ -368,8 +538,11 @@ def chat():
     if STRICT_MODELS and model not in MODELS:
         return error(1002, model)
 
+    tools, tool_choice = normalize_tools(data)
+    has_tools = bool(tools) and tool_choice != "none"
+
     headers = {"API-KEY": api_key, "Content-Type": "application/json"}
-    prompt = build_prompt(messages, data.get("new_input", ""))
+    prompt = build_prompt(messages, data.get("new_input", ""), tools=tools, tool_choice=tool_choice)
 
     attachments = None
     content = messages[-1].get("content")
@@ -392,7 +565,12 @@ def chat():
         if image_paths:
             attachments = {"images": image_paths}
         if text_parts:
-            prompt = build_prompt(messages[:-1] + [{"role": "user", "content": "\n".join(text_parts)}], data.get("new_input", ""))
+            prompt = build_prompt(
+                messages[:-1] + [{"role": "user", "content": "\n".join(text_parts)}],
+                data.get("new_input", ""),
+                tools=tools,
+                tool_choice=tool_choice,
+            )
 
     prompt_tokens = token_count(prompt, model)
     payload = {
@@ -407,7 +585,7 @@ def chat():
         r = requests.post(CHAT_URL, json=payload, headers=headers, timeout=120)
         if r.status_code != 200:
             return upstream_error(r)
-        out = transform_chat(r.json(), model, prompt_tokens)
+        out = transform_chat(r.json(), model, prompt_tokens, has_tools=has_tools)
         resp = make_response(jsonify(out), 200)
         set_headers(resp)
         return resp
@@ -415,7 +593,7 @@ def chat():
     r = requests.post(STREAM_URL, data=json.dumps(payload), headers=headers, stream=True, timeout=120)
     if r.status_code != 200:
         return upstream_error(r)
-    return Response(stream_chat(r, model, prompt_tokens), content_type="text/event-stream")
+    return Response(stream_chat(r, model, prompt_tokens, has_tools=has_tools), content_type="text/event-stream")
 
 
 @app.route("/v1/images/generations", methods=["POST", "OPTIONS"])
