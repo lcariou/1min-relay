@@ -212,16 +212,18 @@ def build_tools_instructions(tools, tool_choice=None) -> str:
 
     lines = [
         "You have access to the following tools/functions. If, and only if, you need "
-        "to call one to fulfil the user's request, respond with nothing else but one "
-        "or more blocks in exactly this format:",
+        "to call one to fulfil the user's request, respond with nothing else but a "
+        "single block in exactly this format, then stop generating immediately:",
         "<tool_call>",
         '{"name": "<tool name>", "arguments": <a JSON object matching the tool parameters>}',
         "</tool_call>",
         "",
-        "You may emit several <tool_call> blocks if several tools are needed. Do not "
-        "add any commentary before, between, or after them when calling a tool. If no "
-        "tool call is required, answer normally in plain text without emitting any "
-        "<tool_call> block.",
+        "Call at most ONE tool per response, and never write the tool's result or "
+        "continue the conversation yourself: the real result will be given back to "
+        "you in a follow-up message, after which you may call another tool if still "
+        "needed. Do not add any commentary before, after, or inside the block when "
+        "calling a tool. If no tool call is required, answer normally in plain text "
+        "without emitting any <tool_call> block.",
         "",
         "Available tools:",
     ]
@@ -246,28 +248,38 @@ def build_tools_instructions(tools, tool_choice=None) -> str:
 
 
 def extract_tool_calls(text: str):
-    """Parse the old-style <tool_call> blocks out of a model completion and
-    return (clean_text, tool_calls) in the OpenAI tool_calls shape."""
-    calls = []
-    for m in TOOL_CALL_RE.finditer(text or ""):
-        try:
-            obj = json.loads(m.group(1))
-        except Exception:
-            continue
+    """Parse the first old-style <tool_call> block out of a model completion
+    and return (clean_text, tool_calls) in the OpenAI tool_calls shape.
+
+    Only the first block is honored, and everything from it onward is
+    dropped: the model was never actually paused to receive a real tool
+    result, so any further text (more <tool_call> blocks, fabricated "tool
+    result" text, etc.) is the model hallucinating the rest of the exchange
+    on its own rather than a genuine second call.
+    """
+    text = text or ""
+    match = TOOL_CALL_RE.search(text)
+    if not match:
+        return text.strip(), None
+
+    try:
+        obj = json.loads(match.group(1))
         name = obj.get("name")
-        if not name:
-            continue
-        args = obj.get("arguments", {})
-        args_str = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
-        calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": name, "arguments": args_str},
-            }
-        )
-    clean = TOOL_CALL_RE.sub("", text or "").strip()
-    return clean, (calls or None)
+    except Exception:
+        name = None
+
+    if not name:
+        return text[: match.start()].strip(), None
+
+    args = obj.get("arguments", {})
+    args_str = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+    call = {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": name, "arguments": args_str},
+    }
+    clean = text[: match.start()].strip()
+    return clean, [call]
 
 
 def render_tool_call_block(tool_call: dict) -> str:
