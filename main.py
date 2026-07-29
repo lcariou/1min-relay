@@ -369,7 +369,23 @@ def upload_image(url: str, headers: dict) -> str:
     return r.json()["fileContent"]["path"]
 
 
+def warn_if_web_used(resp_json):
+    """Log loudly if 1min.ai populated link/search content despite webSearch=false."""
+    try:
+        po = resp_json["aiRecord"]["aiRecordDetail"]["promptObject"]
+        links = po.get("linkContentList") or []
+        searches = po.get("searchContentList") or []
+        if links or searches:
+            logger.warning(
+                "Web content detected despite webSearch=false! links=%s searches=%s",
+                links, searches,
+            )
+    except Exception:
+        pass
+
+
 def transform_chat(resp_json, model: str, prompt_tokens: int, has_tools: bool = False):
+    warn_if_web_used(resp_json)
     text = resp_json["aiRecord"]["aiRecordDetail"]["resultObject"][0]
 
     tool_calls = None
@@ -421,10 +437,18 @@ def iter_upstream_content(resp):
 
         try:
             parsed = json.loads(data)
-            content = parsed.get("content") or parsed.get("delta", {}).get("content") or ""
         except Exception:
-            content = data
+            yield data
+            continue
 
+        # The "result" SSE event carries the full aiRecord (not a content
+        # delta) -- this is where linkContentList/searchContentList live,
+        # so check it here even though it yields no text of its own.
+        if "aiRecord" in parsed:
+            warn_if_web_used(parsed)
+            continue
+
+        content = parsed.get("content") or parsed.get("delta", {}).get("content") or ""
         if content:
             yield content
 
@@ -594,7 +618,11 @@ def chat():
     payload = {
         "type": "UNIFY_CHAT_WITH_AI",
         "model": model,
-        "promptObject": {"prompt": prompt},
+        "promptObject": {
+            "prompt": prompt,
+            # Force web search off regardless of account/UI defaults.
+            "settings": {"webSearchSettings": {"webSearch": False}},
+        },
     }
     if attachments:
         payload["promptObject"]["attachments"] = attachments
