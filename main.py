@@ -311,7 +311,7 @@ def build_prompt(messages, new_input="", tools=None, tool_choice=None):
         role = str(msg.get("role", "")).capitalize()
 
         if msg.get("role") == "tool":
-            content = normalize_text(msg.get("content", ""))
+            content = normalize_text(msg.get("content", "")) or "(no output)"
             lines.append(f"Tool Result (call {msg.get('tool_call_id', '')}):\n{content}")
             continue
 
@@ -547,8 +547,9 @@ def chat():
     if not messages:
         return error(1412)
 
-    last = messages[-1].get("content")
-    if not last:
+    last_message = messages[-1]
+    last = last_message.get("content")
+    if not last and last_message.get("role") != "tool" and not last_message.get("tool_calls"):
         return error(1423)
 
     model = data.get("model", "mistral-nemo")
